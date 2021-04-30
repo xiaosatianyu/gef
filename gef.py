@@ -10072,7 +10072,7 @@ class GefCommand(gdb.Command):
     """GEF main command: view all new commands by typing `gef`."""
 
     _cmdline_ = "gef"
-    _syntax_  = "{:s} (missing|config|save|restore|set|run)".format(_cmdline_)
+    _syntax_  = "{:s} (missing|config|save|restore|set|run|reload)".format(_cmdline_)
 
     def __init__(self):
         super().__init__(self._cmdline_, gdb.COMMAND_SUPPORT, gdb.COMPLETE_NONE, True)
@@ -10091,6 +10091,7 @@ class GefCommand(gdb.Command):
     def setup(self):
         self.load(initial=True)
         # loading GEF sub-commands
+        GefReloadCommand()
         self.doc = GefHelpCommand(self.loaded_commands)
         self.cfg = GefConfigCommand(self.loaded_command_names)
         GefSaveCommand()
@@ -10210,6 +10211,23 @@ class GefCommand(gdb.Command):
                           .format(Color.colorify(nb_missing, "bold red"),
                                   "s" if nb_missing > 1 else "",
                                   Color.colorify("gef missing", "underline pink")))
+        return
+
+
+class GefReloadCommand(gdb.Command):
+    """GEF reload sub-command."""
+    _cmdline_ = "gef reload"
+    _syntax_  = _cmdline_
+
+    def __init__(self):
+        super().__init__(self._cmdline_, gdb.COMMAND_SUPPORT, gdb.COMPLETE_NONE, False)
+        return
+
+    def invoke(self, args, from_tty):
+        with open(os.path.expanduser("~/.gdbinit")) as gdbinit:
+            for line in gdbinit.readlines():
+                if re.match(r"source.*gef.*\.py", line):
+                    gdb.execute(line.strip())
         return
 
 
