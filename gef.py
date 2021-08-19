@@ -910,6 +910,8 @@ class GlibcChunk:
         flags = []
         if self.has_p_bit():
             flags.append(Color.colorify("PREV_INUSE", "red bold"))
+        else:
+            flags.append(Color.colorify("PREV_Free", "blue bold"))
         if self.has_m_bit():
             flags.append(Color.colorify("IS_MMAPPED", "red bold"))
         if self.has_n_bit():
@@ -917,7 +919,7 @@ class GlibcChunk:
         return "|".join(flags)
 
     def __str__(self):
-        msg = "{:s}(addr={:#x}, size={:#x}, flags={:s})".format(Color.colorify("Chunk", "yellow bold underline"),
+        msg = "{:s}(dataaddr={:#x}, size={:#x}, flags={:s})".format(Color.colorify("Chunk", "yellow bold underline"),
                                                                 int(self.address),
                                                                 self.get_chunk_size(),
                                                                 self.flags_as_string())
@@ -3996,7 +3998,7 @@ class GenericCommand(gdb.Command):
             if is_debug():
                 show_last_exception()
             else:
-                err("Command '{:s}' failed to execute properly, reason: {:s}".format(self._cmdline_, str(e)))
+                err("Command '{:s},{:s}' failed to execute properly, reason: {:s}".format(self._cmdline_,args, str(e)))
         return
 
     def usage(self):
@@ -5155,10 +5157,11 @@ class IdaInteractCommand(GenericCommand):
         self.add_setting("host", host, "IP address to use connect to IDA/Binary Ninja script")
         self.add_setting("port", port, "Port to use connect to IDA/Binary Ninja script")
         self.add_setting("sync_cursor", False, "Enable real-time $pc synchronisation")
+        self.add_setting("sync_lib", "", "enable sync in lib")
 
         self.sock = None
         self.version = ("", "")
-        self.old_bps = set()
+        self.old_bps_addr = set()
         return
 
     def is_target_alive(self, host, port):
@@ -5264,18 +5267,28 @@ class IdaInteractCommand(GenericCommand):
         return
 
 
-    def synchronize(self):
-        """Submit all active breakpoint addresses to IDA/BN."""
-        pc = current_arch.pc
-        vmmap = get_process_maps()
-        base_address = min([x.page_start for x in vmmap if x.path == get_filepath()])
-        end_address = max([x.page_end for x in vmmap if x.path == get_filepath()])
-        if not (base_address <= pc < end_address):
-            # do not sync in library
-            return
+    def sync_lib(self, bin_name, vmmap):
 
+        pc = current_arch.pc
+        print("pc:0x{:0>8x}".format(pc))
+        
+        # get lib memory range
+        base_addr=None
+        end_addr=None
+        check_in_bin=False
+        for x in vmmap:
+            if bin_name in x.path:
+                check_in_bin=True
+                break
+        base_address = min([x.page_start for x in vmmap if bin_name in x.path])
+        end_address = max([x.page_end for x in vmmap if bin_name in x.path])
+        print("\nin "+bin_name)
+        print("base 0x{:0>8x}".format(base_address))
+        print("end 0x{:0>8x}".format(end_address))
+        
+        # get cur GDB bps' addr in this bin
         breakpoints = gdb.breakpoints() or []
-        gdb_bps = set()
+        gdb_bps_addr = set()
         for bp in breakpoints:
             if bp.enabled and not bp.temporary:
                 if bp.location[0]=="*": # if it's an address i.e. location starts with "*"
@@ -5283,44 +5296,77 @@ class IdaInteractCommand(GenericCommand):
                 else: # it is a symbol
                     addr = int(gdb.parse_and_eval(bp.location).address)
                 if not (base_address <= addr < end_address):
+                    # only collect the bps in this bin
                     continue
-                gdb_bps.add(addr-base_address)
+                print("current bp addr:0x{:0>8x}".format(addr))
+                gdb_bps_addr.add(addr) # save addr
+        
+        # calculate  the bp changes in this bin
+        added_bps_addr = gdb_bps_addr - self.old_bps_addr
+        removed_bps_addr = self.old_bps_addr - gdb_bps_addr
+        self.old_bps_addr = gdb_bps_addr # it is the address 
+        # only pay attention to the bps in this lib
+        for item in (added_bps_addr,removed_bps_addr):
+            for bp_addr in iter(item.copy()):
+                if not (base_address <= bp_addr < end_address):
+                    item.discard(bp_addr)
 
-        added = gdb_bps - self.old_bps
-        removed = self.old_bps - gdb_bps
-        self.old_bps = gdb_bps
-
+        # sync with ida 
         try:
             # it is possible that the server was stopped between now and the last sync
-            rc = self.sock.sync("{:#x}".format(pc-base_address), list(added), list(removed))
+            # pc-offset, added_bp_addr, removed_bps_addr, lib_base_addr
+            rc = self.sock.sync("{:#x}".format(pc-base_address), list(added_bps_addr), list(removed_bps_addr), base_address)
         except ConnectionRefusedError:
             self.disconnect()
             return
 
-        ida_added, ida_removed = rc
+        # update the bps in GDB
+        ida_added_bps_off, ida_removed_bps_off, ida_base_addr = rc
+        if ida_base_addr == base_address:
+            print("The load image addr in IDA is same with current lib")
 
-        # add new bp from IDA
-        for new_bp in ida_added:
-            location = base_address+new_bp
-            gdb.Breakpoint("*{:#x}".format(location), type=gdb.BP_BREAKPOINT)
-            self.old_bps.add(location)
+            # add new bp from IDA
+            for new_bp_off in ida_added_bps_off:
+                location = ida_base_addr + new_bp_off
+                if not location in self.old_bps_addr:
+                    print("add a new break point at 0x%x"%location)
+                    gdb.Breakpoint("*{:#x}".format(location), type=gdb.BP_BREAKPOINT)
+                    self.old_bps_addr.add(location)
 
-        # and remove the old ones
-        breakpoints = gdb.breakpoints() or []
-        for bp in breakpoints:
-            if bp.enabled and not bp.temporary:
-                if bp.location[0]=="*": # if it's an address i.e. location starts with "*"
-                    addr = int(gdb.parse_and_eval(bp.location[1:]))
-                else: # it is a symbol
-                    addr = int(gdb.parse_and_eval(bp.location).address)
+            # and remove the old ones
+            breakpoints = gdb.breakpoints() or []
+            for bp in breakpoints:
+                if bp.enabled and not bp.temporary:
+                    if bp.location[0]=="*": # if it's an address i.e. location starts with "*"
+                        addr = int(gdb.parse_and_eval(bp.location[1:]))
+                    else: # it is a symbol
+                        addr = int(gdb.parse_and_eval(bp.location).address)
 
-                if not (base_address <= addr < end_address):
-                    continue
+                    if not (base_address <= addr < end_address):
+                        #print("do not add bps not in current lib")
+                        continue
 
-                if (addr-base_address) in ida_removed:
-                    if (addr-base_address) in self.old_bps:
-                        self.old_bps.remove((addr-base_address))
-                    bp.delete()
+                    if (addr-ida_base_addr) in ida_removed_bps_off:
+                        if addr in self.old_bps_addr:
+                            self.old_bps_addr.remove((addr))
+                        print("remove a break point at 0x%x"%(addr))
+                        bp.delete()
+        return 
+    
+    def synchronize(self):
+        """Submit all active breakpoint addresses to IDA/BN."""
+        vmmap = get_process_maps()
+        
+        # sync the main bin
+        self.sync_lib(get_filename(), vmmap)
+
+        # check to sync the lib
+        sync_lib = self.get_setting("sync_lib")
+
+        result = gdb.execute("info sharedlibrary", to_string=True).splitlines()
+        for line in iter(result):
+            if sync_lib in line: 
+                self.sync_lib(sync_lib, vmmap)
         return
 
 
@@ -6389,7 +6435,7 @@ class GlibcHeapCommand(GenericCommand):
     """Base command to get information about the Glibc heap structure."""
 
     _cmdline_ = "heap"
-    _syntax_  = "{:s} (chunk|chunks|bins|arenas)".format(_cmdline_)
+    _syntax_  = "{:s} (datachunk|chunks|bins|arenas)".format(_cmdline_)
 
     def __init__(self):
         super(GlibcHeapCommand, self).__init__(prefix=True)
@@ -6403,7 +6449,7 @@ class GlibcHeapCommand(GenericCommand):
 
 @register_command
 class GlibcHeapSetArenaCommand(GenericCommand):
-    """Display information on a heap chunk."""
+    """Display information on a heap datachunk."""
 
     _cmdline_ = "heap set-arena"
     _syntax_  = "{:s} LOCATION".format(_cmdline_)
@@ -6439,7 +6485,7 @@ class GlibcHeapSetArenaCommand(GenericCommand):
 
 @register_command
 class GlibcHeapArenaCommand(GenericCommand):
-    """Display information on a heap chunk."""
+    """Display information on a heap datachunk."""
 
     _cmdline_ = "heap arenas"
     _syntax_  = _cmdline_
@@ -6461,10 +6507,10 @@ class GlibcHeapArenaCommand(GenericCommand):
 
 @register_command
 class GlibcHeapChunkCommand(GenericCommand):
-    """Display information on a heap chunk.
+    """Display information on a heap datachunk.
     See https://github.com/sploitfun/lsploits/blob/master/glibc/malloc/malloc.c#L1123."""
 
-    _cmdline_ = "heap chunk"
+    _cmdline_ = "heap datachunk"
     _syntax_  = "{:s} LOCATION".format(_cmdline_)
 
     def __init__(self):
