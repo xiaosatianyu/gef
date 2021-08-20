@@ -5404,7 +5404,6 @@ class IdaInteractCommand(GenericCommand):
         self.sock = None
         return
 
-    @obsolete_command
     def do_invoke(self, argv):
         
         def parsed_arglist(arglist):
