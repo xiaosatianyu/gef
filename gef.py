@@ -83,6 +83,7 @@ import time
 import traceback
 import configparser
 import xmlrpc.client as xmlrpclib
+import logging
 
 from functools import lru_cache
 from io import StringIO
@@ -5182,7 +5183,7 @@ class IdaInteractCommand(GenericCommand):
         try:
             sock = xmlrpclib.ServerProxy("http://{:s}:{:d}".format(host, port))
             gef_on_stop_hook(ida_synchronize_handler)
-            gef_on_continue_hook(ida_synchronize_handler)
+            #gef_on_continue_hook(ida_synchronize_handler)
             self.version = sock.version()
         except ConnectionRefusedError:
             err("Failed to connect to '{:s}:{:d}'".format(host, port))
@@ -5197,6 +5198,7 @@ class IdaInteractCommand(GenericCommand):
         return
 
     def do_invoke(self, argv):
+        
         def parsed_arglist(arglist):
             args = []
             for arg in arglist:
@@ -5239,8 +5241,8 @@ class IdaInteractCommand(GenericCommand):
             main_base_address = main_end_address = 0
         else:
             vmmap = get_process_maps()
-            main_base_address = min([x.page_start for x in vmmap if x.realpath == get_filepath()])
-            main_end_address = max([x.page_end for x in vmmap if x.realpath == get_filepath()])
+            main_base_address = min([x.page_start for x in vmmap if x.realpath in get_filepath()])
+            main_end_address = max([x.page_end for x in vmmap if x.realpath in get_filepath()])
 
         try:
             if method_name == "sync":
@@ -5270,7 +5272,7 @@ class IdaInteractCommand(GenericCommand):
     def sync_lib(self, bin_name, vmmap):
 
         pc = current_arch.pc
-        print("pc:0x{:0>8x}".format(pc))
+        #print("pc:0x{:0>8x}, may not in lib".format(pc))
         
         # get lib memory range
         base_addr=None
@@ -5278,13 +5280,12 @@ class IdaInteractCommand(GenericCommand):
         check_in_bin=False
         for x in vmmap:
             if bin_name in x.path:
-                check_in_bin=True
+                base_address = min([x.page_start for x in vmmap if bin_name in x.path])
+                end_address = max([x.page_end for x in vmmap if bin_name in x.path])
                 break
-        base_address = min([x.page_start for x in vmmap if bin_name in x.path])
-        end_address = max([x.page_end for x in vmmap if bin_name in x.path])
-        print("\nin "+bin_name)
-        print("base 0x{:0>8x}".format(base_address))
-        print("end 0x{:0>8x}".format(end_address))
+        # print("sync "+bin_name)
+        # print("base 0x{:0>8x}".format(base_address))
+        # print("end 0x{:0>8x}".format(end_address))
         
         # get cur GDB bps' addr in this bin
         breakpoints = gdb.breakpoints() or []
@@ -5298,7 +5299,7 @@ class IdaInteractCommand(GenericCommand):
                 if not (base_address <= addr < end_address):
                     # only collect the bps in this bin
                     continue
-                print("current bp addr:0x{:0>8x}".format(addr))
+                # print("it has bp addr:0x{:0>8x}".format(addr))
                 gdb_bps_addr.add(addr) # save addr
         
         # calculate  the bp changes in this bin
@@ -5309,48 +5310,47 @@ class IdaInteractCommand(GenericCommand):
         for item in (added_bps_addr,removed_bps_addr):
             for bp_addr in iter(item.copy()):
                 if not (base_address <= bp_addr < end_address):
+                    # print("do not tell ida bp at 0x{:0>8x}".format(bp_addr))
                     item.discard(bp_addr)
+        # for item in iter(added_bps_addr):
+            # print("ready to tell ida to add bp at 0x{:0>8x}".format(item))
+        # for item in iter(removed_bps_addr):
+            # print("ready to tell ida to remove bp at 0x{:0>8x}".format(item))
 
         # sync with ida 
         try:
             # it is possible that the server was stopped between now and the last sync
             # pc-offset, added_bp_addr, removed_bps_addr, lib_base_addr
-            rc = self.sock.sync("{:#x}".format(pc-base_address), list(added_bps_addr), list(removed_bps_addr), base_address)
+            rc = self.sock.sync("{:#x}".format(pc), list(added_bps_addr), list(removed_bps_addr), "{:#x}".format(base_address))
         except ConnectionRefusedError:
             self.disconnect()
             return
 
         # update the bps in GDB
         ida_added_bps_off, ida_removed_bps_off, ida_base_addr = rc
-        if ida_base_addr == base_address:
-            print("The load image addr in IDA is same with current lib")
 
-            # add new bp from IDA
-            for new_bp_off in ida_added_bps_off:
-                location = ida_base_addr + new_bp_off
-                if not location in self.old_bps_addr:
-                    print("add a new break point at 0x%x"%location)
-                    gdb.Breakpoint("*{:#x}".format(location), type=gdb.BP_BREAKPOINT)
-                    self.old_bps_addr.add(location)
+        # add new bp from IDA
+        for new_bp_off in ida_added_bps_off:
+            location = ida_base_addr + new_bp_off
+            if not location in self.old_bps_addr:
+                print("add a new break point at 0x%x"%location)
+                gdb.Breakpoint("*{:#x}".format(location), type=gdb.BP_BREAKPOINT)
+                self.old_bps_addr.add(location)
 
-            # and remove the old ones
-            breakpoints = gdb.breakpoints() or []
-            for bp in breakpoints:
-                if bp.enabled and not bp.temporary:
-                    if bp.location[0]=="*": # if it's an address i.e. location starts with "*"
-                        addr = int(gdb.parse_and_eval(bp.location[1:]))
-                    else: # it is a symbol
-                        addr = int(gdb.parse_and_eval(bp.location).address)
+        # and remove the old ones
+        breakpoints = gdb.breakpoints() or []
+        for bp in breakpoints:
+            if bp.enabled and not bp.temporary:
+                if bp.location[0]=="*": # if it's an address i.e. location starts with "*"
+                    addr = int(gdb.parse_and_eval(bp.location[1:]))
+                else: # it is a symbol
+                    addr = int(gdb.parse_and_eval(bp.location).address)
 
-                    if not (base_address <= addr < end_address):
-                        #print("do not add bps not in current lib")
-                        continue
-
-                    if (addr-ida_base_addr) in ida_removed_bps_off:
-                        if addr in self.old_bps_addr:
-                            self.old_bps_addr.remove((addr))
-                        print("remove a break point at 0x%x"%(addr))
-                        bp.delete()
+                if (addr-ida_base_addr) in ida_removed_bps_off:
+                    if addr in self.old_bps_addr:
+                        self.old_bps_addr.remove((addr))
+                    print("remove a break point at 0x%x"%(addr))
+                    bp.delete()
         return 
     
     def synchronize(self):
