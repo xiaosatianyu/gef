@@ -9,7 +9,6 @@ for `malloc` structure information). Syntax to the subcommands is straight forwa
 gef➤ heap <sub_commands>
 ```
 
-
 ### `heap chunks` command ###
 
 Displays all the chunks from the `heap` section.
@@ -19,14 +18,18 @@ gef➤ heap chunks
 ```
 
 In some cases, the allocation will start immediately from start of the page. If
-so, specify the base address of the first chunk as follow:
+so, specify the base address of the first chunk as follows:
 
 ```
-gef➤ heap chunks <LOCATION>
+gef➤ heap chunks [address]
 ```
 
 ![heap-chunks](https://i.imgur.com/2Ew2fA6.png)
 
+Because usually the heap chunks are aligned to a certain number of bytes in
+memory GEF automatically re-aligns the chunks data start addresses to match
+Glibc's behavior. To be able to view unaligned chunks as well, you can
+disable this with the `--allow-unaligned` flag.
 
 ### `heap chunk` command ###
 
@@ -35,12 +38,15 @@ provide the address to the user memory pointer of the chunk to show the
 information related to a specific chunk:
 
 ```
-gef➤ heap chunk <LOCATION>
+gef➤ heap chunk [address]
 ```
 
 ![heap-chunk](https://i.imgur.com/SAWNptW.png)
 
-
+Because usually the heap chunks are aligned to a certain number of bytes in
+memory GEF automatically re-aligns the chunks data start addresses to match
+Glibc's behavior. To be able to view unaligned chunks as well, you can
+disable this with the `--allow-unaligned` flag.
 
 ### `heap arenas` command ###
 
@@ -51,8 +57,6 @@ call the command**.
 
 ![heap-arenas](https://i.imgur.com/ajbLiCF.png)
 
-
-
 ### `heap set-arena` command ###
 
 In cases where the debug symbol are not present (e.g. statically stripped
@@ -60,16 +64,15 @@ binary), it is possible to instruct GEF to find the `main_arena` at a different
 location with the command:
 
 ```
-gef➤ heap set-arena <LOCATION>
+gef➤ heap set-arena [address]
 ```
 
 If the arena address is correct, all `heap` commands will be functional, and use
 the specified address for `main_arena`.
 
-
 ### `heap bins` command ###
 
-Glibc uses bints for keeping tracks of `free`d chunks. This is because making
+Glibc uses bins for keeping tracks of `free`d chunks. This is because making
 allocations through `sbrk` (requiring a syscall) is costly. Glibc uses those
 bins to remember formerly allocated chunks. Because bins are structured in
 single or doubly linked list, I found that quite painful to always interrogate
@@ -77,12 +80,12 @@ single or doubly linked list, I found that quite painful to always interrogate
 I decided to implement the `heap bins` sub-command, which allows to get info
 on:
 
-   - `fastbins`
-   - `bins`
-      - `unsorted`
-      - `small bins`
-      - `large bins`
-
+- `fastbins`
+- `bins`
+  - `unsorted`
+  - `small bins`
+  - `large bins`
+- `tcachebins`
 
 #### `heap bins fast` command ####
 
@@ -109,10 +112,29 @@ Fastbin[8] 0x00
 Fastbin[9] 0x00
 ```
 
-
 #### Other `heap bins X` command ####
 
-All the other subcommands for the `heap bins` work the same way as `fast`. If
-no argument is provided, `gef` will fall back to `main_arena`. Otherwise, it
-will use the address pointed as the base of the `malloc_state` structure and
-print out information accordingly.
+All the other subcommands (with the exception of `tcache`) for the `heap bins`
+work the same way as `fast`. If no argument is provided, `gef` will fall back
+to `main_arena`. Otherwise, it will use the address pointed as the base of the
+`malloc_state` structure and print out information accordingly.
+
+#### `heap bins tcache` command ####
+
+Modern versions of `glibc` use `tcache` bins to speed up multithreaded
+programs.  Unlike other bins, `tcache` bins are allocated on a per-thread
+basis, so there is one set of `tcache` bins for each thread.
+
+```
+gef➤ heap bins tcache [all] [thread_ids...]
+```
+
+Without any arguments, `heap bins tcache` will display the `tcache` for the
+current thread. `heap bins tcache all` will show the `tcache`s for every
+thread, or you can specify any number of thread ids to see the `tcache` for
+each of them. For example, use the following command to show the `tcache` bins
+for threads 1 and 2.
+
+```
+gef➤ heap bins tcache 1 2
+```

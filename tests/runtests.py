@@ -3,9 +3,7 @@
 # Run tests by spawning a gdb instance for every command.
 #
 
-from __future__ import print_function
-
-import sys
+import re
 import unittest
 import subprocess
 
@@ -15,14 +13,14 @@ from helpers import (
     gdb_start_silent_cmd,
     gdb_start_silent_cmd_last_line,
     gdb_test_python_method
-)
+) # pylint: disable=import-error
 
 
 class GefUnitTestGeneric(unittest.TestCase):
     """Generic class for command testing, that defines all helpers"""
 
     @staticmethod
-    def assertNoException(buf): #pylint: disable=invalid-name
+    def assertNoException(buf):
         if not ("Python Exception <" not in buf
                 and "Traceback" not in buf
                 and "'gdb.error'" not in buf
@@ -31,12 +29,12 @@ class GefUnitTestGeneric(unittest.TestCase):
             raise AssertionError("Detected error in gdb output")
 
     @staticmethod
-    def assertFailIfInactiveSession(buf): #pylint: disable=invalid-name
+    def assertFailIfInactiveSession(buf):
         if "No debugging session active" not in buf:
             raise AssertionError("No debugging session inactive warning")
 
 
-class TestGefCommands(GefUnitTestGeneric): #pylint: disable=too-many-public-methods
+class TestGefCommandsUnit(GefUnitTestGeneric):
     """Tests GEF GDB commands."""
 
     def test_cmd_canary(self):
@@ -52,6 +50,14 @@ class TestGefCommands(GefUnitTestGeneric): #pylint: disable=too-many-public-meth
         res = gdb_start_silent_cmd("capstone-disassemble")
         self.assertNoException(res)
         self.assertTrue(len(res.splitlines()) > 1)
+
+        self.assertFailIfInactiveSession(gdb_run_cmd("cs --show-opcodes"))
+        res = gdb_start_silent_cmd("cs --show-opcodes")
+        self.assertNoException(res)
+        self.assertTrue(len(res.splitlines()) > 1)
+        # match the following pattern
+        # 0x5555555546b2 897dec      <main+8>         mov    DWORD PTR [rbp-0x14], edi
+        self.assertRegex(res, r"0x.{12}\s([0-9a-f]{2})+\s+.*")
         return
 
     def test_cmd_checksec(self):
@@ -197,6 +203,23 @@ class TestGefCommands(GefUnitTestGeneric): #pylint: disable=too-many-public-meth
         self.assertIn("size=0x20", res)
         return
 
+    def test_cmd_heap_bins_tcache(self):
+        cmd = "heap bins tcache"
+        target = "/tmp/heap-non-main.out"
+        res = gdb_run_silent_cmd(cmd, target=target)
+        self.assertNoException(res)
+        self.assertIn("Tcachebins[idx=0, size=0x20] count=1", res)
+        return
+
+    def test_cmd_heap_bins_tcache_all(self):
+        cmd = "heap bins tcache all"
+        target = "/tmp/heap-tcache.out"
+        res = gdb_run_silent_cmd(cmd, target=target)
+        self.assertNoException(res)
+        self.assertIn("Tcachebins[idx=0, size=0x20] count=3", res)
+        self.assertIn("Tcachebins[idx=1, size=0x30] count=3", res)
+        return
+
     def test_cmd_heap_analysis(self):
         cmd = "heap-analysis-helper"
         target = "/tmp/heap-analysis.out"
@@ -216,21 +239,62 @@ class TestGefCommands(GefUnitTestGeneric): #pylint: disable=too-many-public-meth
         self.assertFailIfInactiveSession(gdb_run_cmd("hexdump $pc"))
         res = gdb_start_silent_cmd("hexdump qword $pc")
         self.assertNoException(res)
-        res = gdb_start_silent_cmd("hexdump dword $pc l1")
+        res = gdb_start_silent_cmd("hexdump dword $pc -s 1")
         self.assertNoException(res)
-        res = gdb_start_silent_cmd("hexdump word $pc l5 reverse")
+        res = gdb_start_silent_cmd("hexdump word $pc -s 5 -r")
         self.assertNoException(res)
-        res = gdb_start_silent_cmd("hexdump byte $sp l32")
+        res = gdb_start_silent_cmd("hexdump byte $sp -s 32")
         self.assertNoException(res)
         return
 
+    def test_cmd_memory_watch(self):
+        self.assertFailIfInactiveSession(gdb_run_cmd("memory watch $pc"))
+        res = gdb_start_silent_cmd("memory watch $pc 0x100 byte")
+        self.assertNoException(res)
+        res = gdb_start_silent_cmd("memory watch $pc 0x40 word")
+        self.assertNoException(res)
+        res = gdb_start_silent_cmd("memory watch $pc 0x30 dword")
+        self.assertNoException(res)
+        res = gdb_start_silent_cmd("memory watch $pc 0x20 qword")
+        self.assertNoException(res)
+        res = gdb_start_silent_cmd("memory watch $pc 0x8 pointers")
+        self.assertNoException(res)
+        res = gdb_start_silent_cmd("memory watch $pc")
+        self.assertNoException(res)
+        target = "/tmp/memwatch.out"
+        res = gdb_run_cmd("memory watch &myglobal",
+                before=["gef config context.layout 'memory'", "r <<< $((0xdeadbeef))"],
+                after=["c", "q"], target=target)
+        self.assertIn("deadbeef", res)
+        self.assertNotIn("cafebabe", res)
+        res = gdb_run_cmd("memory watch &myglobal",
+                before=["gef config context.layout 'memory'", "r <<< $((0xcafebabe))"],
+                after=["c", "q"], target=target)
+        self.assertIn("cafebabe", res)
+        self.assertNotIn("deadbeef", res)
+
+    def test_cmd_memory_unwatch(self):
+        self.assertFailIfInactiveSession(gdb_run_cmd("memory unwatch $pc"))
+        res = gdb_start_silent_cmd("memory unwatch $pc")
+        self.assertNoException(res)
+
+    def test_cmd_memory_list(self):
+        self.assertFailIfInactiveSession(gdb_run_cmd("memory list"))
+        res = gdb_start_silent_cmd("memory list")
+        self.assertNoException(res)
+
+    def test_cmd_memory_reset(self):
+        self.assertFailIfInactiveSession(gdb_run_cmd("memory reset"))
+        res = gdb_start_silent_cmd("memory reset")
+        self.assertNoException(res)
+
     def test_cmd_keystone_assemble(self):
         valid_cmds = [
-            "assemble nop; xor eax, eax; int 0x80",
-            "assemble -a arm -m arm add r0, r1, r2",
-            "assemble -a mips -m mips32 add $v0, 1",
-            "assemble -a sparc -m sparc32  set 0, %o0",
-            "assemble -a arm64 -m little_endian add x29, sp, 0; mov  w0, 0; ret"
+            "assemble nop; xor eax, eax; syscall",
+            "assemble --arch arm   --mode arm add  r0, r1, r2",
+            "assemble --arch mips  --mode mips32   add $v0, 1",
+            "assemble --arch sparc --mode sparc32  set 0, %o0",
+            "assemble --arch arm64 --mode arm add x29, sp, 0; mov  w0, 0; ret"
         ]
         for cmd in valid_cmds:
             res = gdb_start_silent_cmd(cmd)
@@ -282,14 +346,28 @@ class TestGefCommands(GefUnitTestGeneric): #pylint: disable=too-many-public-meth
         self.assertIn("Gef!Gef!Gef!Gef!", res)
         return
 
-    def test_cmd_pattern(self):
+    def test_cmd_pattern_create(self):
         cmd = "pattern create 32"
         target = "/tmp/pattern.out"
         res = gdb_run_cmd(cmd, target=target)
         self.assertNoException(res)
-        self.assertIn("aaaaaaaabaaaaaaacaaaaaaadaaaaaaa", res)
+        self.assertIn("aaaabaaacaaadaaaeaaaf", res)
 
+        cmd = "pattern create --period 8 32"
+        target = "/tmp/pattern.out"
+        res = gdb_run_cmd(cmd, target=target)
+        self.assertNoException(res)
+        self.assertIn("aaaaaaaabaaaaaaacaaaaaaadaaaaaaa", res)
+        return
+
+    def test_cmd_pattern_search(self):
         cmd = "pattern search $rbp"
+        target = "/tmp/pattern.out"
+        res = gdb_run_cmd(cmd, before=["set args aaaabaaacaaadaaaeaaafaaagaaahaaa", "run"], target=target)
+        self.assertNoException(res)
+        self.assertIn("Found at offset", res)
+
+        cmd = "pattern search --period 8 $rbp"
         target = "/tmp/pattern.out"
         res = gdb_run_cmd(cmd, before=["set args aaaaaaaabaaaaaaacaaaaaaadaaaaaaa", "run"], target=target)
         self.assertNoException(res)
@@ -301,12 +379,12 @@ class TestGefCommands(GefUnitTestGeneric): #pylint: disable=too-many-public-meth
         res = gdb_start_silent_cmd("print-format $rsp")
         self.assertNoException(res)
         self.assertTrue("buf = [" in res)
-        res = gdb_start_silent_cmd("print-format -f js $rsp")
+        res = gdb_start_silent_cmd("print-format --lang js $rsp")
         self.assertNoException(res)
         self.assertTrue("var buf = [" in res)
-        res = gdb_start_silent_cmd("print-format -f iDontExist $rsp")
+        res = gdb_start_silent_cmd("print-format --lang iDontExist $rsp")
         self.assertNoException(res)
-        self.assertTrue("Language must be :" in res)
+        self.assertTrue("Language must be in:" in res)
         return
 
     def test_cmd_process_status(self):
@@ -316,6 +394,20 @@ class TestGefCommands(GefUnitTestGeneric): #pylint: disable=too-many-public-meth
         self.assertIn("Process Information", res)
         self.assertIn("No child process", res)
         self.assertIn("No open connections", res)
+        return
+
+    def test_cmd_process_search(self):
+        res = gdb_start_silent_cmd("process-search", target="/tmp/pattern.out", before=["set args w00tw00t", ])
+        self.assertNoException(res)
+        self.assertIn("/tmp/pattern.out", res)
+
+        res = gdb_start_silent_cmd("process-search gdb.*fakefake", target="/tmp/pattern.out", before=["set args w00tw00t", ])
+        self.assertNoException(res)
+        self.assertIn("gdb", res)
+
+        res = gdb_start_silent_cmd("process-search --smart-scan gdb.*fakefake", target="/tmp/pattern.out", before=["set args w00tw00t", ])
+        self.assertNoException(res)
+        self.assertNotIn("gdb", res)
         return
 
     def test_cmd_registers(self):
@@ -376,6 +468,25 @@ class TestGefCommands(GefUnitTestGeneric): #pylint: disable=too-many-public-meth
         res = gdb_start_silent_cmd("set-permission 0x1338000", target=target)
         self.assertNoException(res)
         self.assertIn("Unmapped address", res)
+
+        # Make sure set-permission command doesn't clobber any register
+        before = [
+            "gef config context.clear_screen False",
+            "gef config context.layout '-code -stack'",
+            "entry-break",
+            "printf \"match_before\\n\"",
+            "info registers all",
+            "printf \"match_before\\n\""
+        ]
+        after = [
+            "printf \"match_after\\n\"",
+            "info registers all",
+            "printf \"match_after\\n\""
+        ]
+        res = gdb_run_cmd("set-permission $sp", before=before, after=after, target=target)
+        regs_before = re.match(r"(?:.*match_before)(.+)(?:match_before.*)", res, flags=re.DOTALL)[1]
+        regs_after = re.match(r"(?:.*match_after)(.+)(?:match_after.*)", res, flags=re.DOTALL)[1]
+        self.assertEqual(regs_before, regs_after)
         return
 
     def test_cmd_shellcode(self):
@@ -436,13 +547,13 @@ class TestGefCommands(GefUnitTestGeneric): #pylint: disable=too-many-public-meth
         self.assertFailIfInactiveSession(res)
 
         cmd = "trace-run $pc+1"
-        res = gdb_start_silent_cmd(cmd,before=["gef config trace-run.tracefile_prefix /tmp/gef-trace-"])
+        res = gdb_start_silent_cmd(cmd, before=["gef config trace-run.tracefile_prefix /tmp/gef-trace-"])
         self.assertNoException(res)
         self.assertIn("Tracing from", res)
         return
 
     def test_cmd_unicorn_emulate(self):
-        cmd = "emu -n 1"
+        cmd = "emu 10"
         res = gdb_run_cmd(cmd)
         self.assertFailIfInactiveSession(res)
 
@@ -500,20 +611,34 @@ class TestGefCommands(GefUnitTestGeneric): #pylint: disable=too-many-public-meth
             "highlight add 43434343 green",
             "highlight add 44444444 pink",
             'patch string $rsp "AAAABBBBCCCCDDDD"',
-            "hexdump qword $rsp 2"
+            "hexdump qword $rsp -s 2"
         ]
 
         res = gdb_start_silent_cmd('', after=cmds, strip_ansi=False)
 
         self.assertNoException(res)
-        self.assertIn("\033[33m41414141\x1b[0m", res)
-        self.assertIn("\033[34m42424242\x1b[0m", res)
-        self.assertIn("\033[32m43434343\x1b[0m", res)
-        self.assertIn("\033[35m44444444\x1b[0m", res)
+        self.assertIn("\x1b[33m41414141\x1b[0m", res)
+        self.assertIn("\x1b[34m42424242\x1b[0m", res)
+        self.assertIn("\x1b[32m43434343\x1b[0m", res)
+        self.assertIn("\x1b[35m44444444\x1b[0m", res)
+        return
+
+    def test_cmd_aliases(self):
+        # test add functionality
+        add_res = gdb_start_silent_cmd("aliases add alias_function_test example")
+        self.assertNoException(add_res)
+        # test list functionality
+        list_res = gdb_start_silent_cmd("aliases ls", before=["aliases add alias_function_test example"])
+        self.assertNoException(list_res)
+        self.assertIn("alias_function_test", list_res)
+        # test rm functionality
+        rm_res = gdb_start_silent_cmd("aliases ls", before=["aliases add alias_function_test example", "aliases rm alias_function_test"])
+        self.assertNoException(rm_res)
+        self.assertNotIn("alias_function_test", rm_res)
         return
 
 
-class TestGefFunctions(GefUnitTestGeneric):
+class TestGefFunctionsUnit(GefUnitTestGeneric):
     """Tests GEF internal functions."""
 
     def test_func_get_memory_alignment(self):
@@ -550,7 +675,8 @@ class TestGefFunctions(GefUnitTestGeneric):
         self.assertTrue(int(res.splitlines()[-1]))
         return
 
-class TestGdbFunctions(GefUnitTestGeneric):
+
+class TestGdbFunctionsUnit(GefUnitTestGeneric):
     """Tests gdb convenience functions added by GEF."""
 
     def test_func_base(self):
@@ -607,11 +733,50 @@ class TestGdbFunctions(GefUnitTestGeneric):
         return
 
 
-def run_tests(name=None):
+class TestGefConfigUnit(GefUnitTestGeneric):
+    """Test GEF configuration paramaters."""
 
-    runner = unittest.TextTestRunner(verbosity=3)
-    unittest.main(testRunner=runner)
+    def test_config_show_opcodes_size(self):
+        """Check opcodes are correctly shown"""
+        res = gdb_run_cmd("entry-break", before=["gef config context.show_opcodes_size 4",])
+        self.assertNoException(res)
+        self.assertTrue(len(res.splitlines()) > 1)
+        # match one of the following patterns
+        # 0x5555555546b2 897dec      <main+8>         mov    DWORD PTR [rbp-0x14], edi
+        # 0x5555555546b5 488975e0    <main+11>        mov    QWORD PTR [rbp-0x20], rsi
+        # 0x5555555546b9 488955d8    <main+15>        mov    QWORD PTR [rbp-0x28], rdx
+        # 0x5555555546bd 64488b04... <main+19>        mov    rax, QWORD PTR fs:0x28
+        self.assertRegex(res, r"0x.{12}\s([0-9a-f]{2}){1,4}(\.\.\.)?\s+.*")
+        return
+
+
+class TestNonRegressionUnit(GefUnitTestGeneric):
+    """Non-regression tests."""
+
+    def test_registers_show_registers_in_correct_order(self):
+        """Ensure the registers are printed in the correct order (PR #670)."""
+        cmd = "registers"
+        x64_registers_in_correct_order = ["$rax", "$rbx", "$rcx", "$rdx", "$rsp", "$rbp", "$rsi", "$rdi", "$rip", "$r8", "$r9", "$r10", "$r11", "$r12", "$r13", "$r14", "$r15", "$eflags", "$cs", ]
+        lines = gdb_start_silent_cmd(cmd).splitlines()[-len(x64_registers_in_correct_order):]
+        lines = [ line.split(' ')[0].replace(':', '') for line in lines ]
+        self.assertEqual(x64_registers_in_correct_order, lines)
+        return
+
+
+    def test_context_correct_registers_refresh_with_frames(self):
+        """Ensure registers are correctly refreshed when changing frame (PR #668)"""
+        lines = gdb_run_silent_cmd("registers", after=["frame 5", "registers"], target="/tmp/nested.out").splitlines()
+        rips = [ x for x in lines if x.startswith("$rip") ]
+        self.assertEqual(len(rips), 2) # we must have only 2 entries
+        self.assertNotEqual(rips[0], rips[1]) # they must be different
+        self.assertIn("<f10", rips[0]) # the first one must be in the f10 frame
+        self.assertIn("<f5", rips[1]) # the second one must be in the f5 frame
+        return
+
+
+def run_tests():
+    unittest.main(testRunner=unittest.TextTestRunner(verbosity=3))
 
 
 if __name__ == "__main__":
-    sys.exit(run_tests())
+    run_tests()
